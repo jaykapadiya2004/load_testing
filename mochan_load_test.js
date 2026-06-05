@@ -17,7 +17,7 @@ const llmCallsTrend   = new Trend("llm_calls_per_turn");     // LLM calls per re
 const processingTrend = new Trend("server_processing_ms");   // server-side processing time
 
 // ── CONFIG — change these to match your setup ─────────────────────────────────
-const API_BASE   = "http://localhost:8021";
+const API_BASE   = "http://localhost:8022";
 const CHATBOT_ID = "24c0e23c-c7c0-4bc9-ba64-9708816d17e0";
 
 // ── Test stages — 3 phases: warm-up → stress → cool-down ─────────────────────
