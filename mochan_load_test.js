@@ -10,6 +10,7 @@ import { Counter, Rate, Trend } from "k6/metrics";
 
 // ── Custom metrics ────────────────────────────────────────────────────────────
 const chatErrors      = new Counter("chat_errors");          // total error count
+const rateLimitHits   = new Counter("chat_rate_limit_hits"); // 429 rate limit hits
 const errorRate       = new Rate("chat_error_rate");         // % of failed requests
 const responseTrend   = new Trend("chat_response_ms", true); // latency distribution
 const llmCallsTrend   = new Trend("llm_calls_per_turn");     // LLM calls per response
@@ -107,8 +108,17 @@ function makeUserId() {
   return `k6_vu${__VU}_iter${__ITER}`;
 }
 
+// ── Rate-limit constants ──────────────────────────────────────────────────────
+const MIN_TURN_GAP_S = 15;   // server enforces ~15s between messages per user
+const MAX_RETRIES    = 3;    // how many times to retry a 429 before giving up
+const RETRY_WAIT_S   = 16;   // wait this long after a 429 before retrying
+
 // ── Main test function (runs once per VU per iteration) ───────────────────────
 export default function () {
+  // Stagger VU startup to avoid thundering-herd at t=0.
+  // Without this, all VUs fire their first request simultaneously.
+  sleep(Math.random() * 10); // 0–10s random startup delay
+
   const userId      = makeUserId();
   const chatHistory = [];          // each VU maintains its own conversation history
 
@@ -132,9 +142,24 @@ export default function () {
       tags:    { turn: String(turn + 1) }, // tag each request with turn number
     };
 
-    const t0  = Date.now();
-    const res = http.post(`${API_BASE}/api/chat`, payload, params);
-    const ms  = Date.now() - t0;
+    // ── POST with 429 retry ─────────────────────────────────────────────────
+    let res;
+    let attempt = 0;
+    while (attempt <= MAX_RETRIES) {
+      res = http.post(`${API_BASE}/api/chat`, payload, params);
+      if (res.status !== 429) break;
+      attempt++;
+      if (attempt <= MAX_RETRIES) {
+        rateLimitHits.add(1);
+        console.warn(
+          `[VU ${__VU} | Turn ${turn + 1}] 429 rate-limited — ` +
+          `waiting ${RETRY_WAIT_S}s before retry ${attempt}/${MAX_RETRIES}`
+        );
+        sleep(RETRY_WAIT_S);
+      }
+    }
+
+    const ms  = res.timings.duration; // use k6's built-in timing (more accurate)
 
     // ── Record latency ──────────────────────────────────────────────────────
     responseTrend.add(ms);
@@ -183,15 +208,16 @@ export default function () {
       chatHistory.push({ role: "assistant", content: data ? data.response : "" });
     }
 
-    // ── Think time between turns (realistic user pause: 3–8 seconds) ─────────
-    // This is important! Without this, k6 hammers your server unrealistically.
+    // ── Think time between turns ──────────────────────────────────────────────
+    // Server requires ~15s between messages per user. We use 13–18s to stay
+    // safely above the limit while still feeling like a real user.
     if (turn < turnCount - 1) {
-      sleep(Math.random() * 5 + 3); // 3 to 8 second pause between messages
+      sleep(Math.random() * 5 + MIN_TURN_GAP_S - 2); // 13–18s pause between messages
     }
   }
 
   // ── Pause between full conversations (simulates user closing/reopening) ──────
-  sleep(Math.random() * 5 + 5); // 5 to 10 seconds between sessions
+  sleep(Math.random() * 10 + 10); // 10–20s between sessions
 }
 
 // ── Summary handler — printed at the end of the test ─────────────────────────
@@ -209,6 +235,7 @@ function buildSummary(data) {
   const p95  = val(m, "chat_response_ms", "p(95)");
   const p99  = val(m, "chat_response_ms", "p(99)");
   const errR = val(m, "chat_error_rate",  "rate");
+  const rlHits = m["chat_rate_limit_hits"] ? m["chat_rate_limit_hits"].values.count : 0;
   const llm  = val(m, "llm_calls_per_turn", "avg");
   const proc = val(m, "server_processing_ms", "p(95)");
 
@@ -222,7 +249,8 @@ function buildSummary(data) {
 ║    p99  : ${pad(p99  != null ? ms(p99)  : "n/a")}                          ║
 ╠══════════════════════════════════════════════════════════╣
 ║  RELIABILITY                                             ║
-║    Error rate : ${pad(errR != null ? pct(errR) : "n/a")}                   ║
+║    Error rate     : ${pad(errR != null ? pct(errR) : "n/a")}               ║
+║    429 rate-limits: ${pad(String(rlHits))}                                 ║
 ╠══════════════════════════════════════════════════════════╣
 ║  SERVER-SIDE (from response debug fields)                ║
 ║    Avg LLM calls/turn : ${pad(llm  != null ? llm.toFixed(2)  : "n/a")}     ║
