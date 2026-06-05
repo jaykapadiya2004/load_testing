@@ -109,7 +109,7 @@ function makeUserId() {
 }
 
 // ── Rate-limit constants ──────────────────────────────────────────────────────
-const MIN_TURN_GAP_S = 15;   // server enforces ~15s between messages per user
+const MIN_TURN_GAP_S = 20;   // server enforces ~15s between messages per user
 const MAX_RETRIES    = 3;    // how many times to retry a 429 before giving up
 const RETRY_WAIT_S   = 16;   // wait this long after a 429 before retrying
 
